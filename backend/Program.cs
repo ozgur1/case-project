@@ -10,13 +10,24 @@ using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
-var conn = builder.Configuration.GetConnectionString("DefaultConnection") ?? "Data Source=chatapp.db";
+var conn = builder.Configuration.GetConnectionString("DefaultConnection")
+            ?? "Data Source=chatapp.db";
+
 builder.Services.AddDbContext<AppDbContext>(opt => opt.UseSqlite(conn));
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader();
+    });
+});
+
 var app = builder.Build();
+app.UseCors();
 
 using (var scope = app.Services.CreateScope())
 {
@@ -32,8 +43,10 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+/* ============================================================
+   ✅ SENTIMENT SERVİSİ
+   ============================================================ */
 
-// ✅ SENTIMENT ANALİZİ — FULL YENİ SÜRÜM
 async Task<string> AnalyzeSentimentAsync(string text)
 {
     using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(25) };
@@ -43,112 +56,50 @@ async Task<string> AnalyzeSentimentAsync(string text)
 
     var payload = new { data = new[] { text } };
 
-    async Task<(bool ok, string label, int status)> TryCall(string url)
+    async Task<(bool ok, string label)> TryCall(string url)
     {
-        Console.WriteLine($"[HF CALL] {url}");
-
-        HttpResponseMessage resp;
         try
         {
-            resp = await client.PostAsJsonAsync(url, payload);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[HF ERROR CALL] {ex.Message}");
-            return (false, "neutral", 0);
-        }
+            var resp = await client.PostAsJsonAsync(url, payload);
+            if (!resp.IsSuccessStatusCode) return (false, "neutral");
 
-        var raw = await resp.Content.ReadAsStringAsync();
-        Console.WriteLine($"[HF RESPONSE] Status {(int)resp.StatusCode} :: {raw[..Math.Min(raw.Length, 300)]}");
+            var raw = await resp.Content.ReadAsStringAsync();
+            var doc = JsonDocument.Parse(raw);
 
-        if (!resp.IsSuccessStatusCode || string.IsNullOrWhiteSpace(raw))
-            return (false, "neutral", (int)resp.StatusCode);
-
-        try
-        {
-            using var doc = JsonDocument.Parse(raw);
-            var root = doc.RootElement;
-
-            // ✅ Beklenen format: { "data": [ { "label": "..."} ] }
-            if (root.TryGetProperty("data", out var dataElem) &&
-                dataElem.ValueKind == JsonValueKind.Array &&
-                dataElem.GetArrayLength() > 0)
+            if (doc.RootElement.TryGetProperty("data", out var arr))
             {
-                var first = dataElem[0];
-
-                if (first.ValueKind == JsonValueKind.Object &&
-                    first.TryGetProperty("label", out var lbl))
-                {
-                    var label = lbl.GetString()?.ToLower() ?? "neutral";
-                    if (label.Contains("pos")) return (true, "positive", (int)resp.StatusCode);
-                    if (label.Contains("neg")) return (true, "negative", (int)resp.StatusCode);
-                    return (true, "neutral", (int)resp.StatusCode);
-                }
-
-                if (first.ValueKind == JsonValueKind.String)
-                {
-                    var label = first.GetString()?.ToLower() ?? "neutral";
-                    if (label.Contains("pos")) return (true, "positive", (int)resp.StatusCode);
-                    if (label.Contains("neg")) return (true, "negative", (int)resp.StatusCode);
-                    return (true, "neutral", (int)resp.StatusCode);
-                }
-            }
-
-            // ✅ Router formatı: [[ { "label": "POSITIVE" } ]]
-            if (root.ValueKind == JsonValueKind.Array &&
-                root.GetArrayLength() > 0 &&
-                root[0].ValueKind == JsonValueKind.Array)
-            {
-                var obj = root[0][0];
-                if (obj.ValueKind == JsonValueKind.Object &&
-                    obj.TryGetProperty("label", out var lbl2))
-                {
-                    var label = lbl2.GetString()?.ToLower() ?? "neutral";
-                    if (label.Contains("pos") || label.Contains("label_2")) return (true, "positive", (int)resp.StatusCode);
-                    if (label.Contains("neg") || label.Contains("label_0")) return (true, "negative", (int)resp.StatusCode);
-                    return (true, "neutral", (int)resp.StatusCode);
-                }
+                var label = arr[0].GetProperty("label").GetString() ?? "neutral";
+                return (true,
+                    label.ToLower().Contains("pos") ? "positive" :
+                    label.ToLower().Contains("neg") ? "negative" : "neutral"
+                );
             }
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[HF PARSE ERROR] {ex.Message}");
-            return (false, "neutral", (int)resp.StatusCode);
-        }
+        catch { }
 
-        return (false, "neutral", (int)resp.StatusCode);
+        return (false, "neutral");
     }
 
-    // 1) ana endpoint
-    var r1 = await TryCall(primaryUrl);
-    if (r1.ok) return r1.label;
+    var a = await TryCall(primaryUrl);
+    if (a.ok) return a.label;
 
-    // 503 ise Space uyuyor olabilir → tekrar dene
-    if (r1.status == 503 || r1.status == 502 || r1.status == 504)
-    {
-        Console.WriteLine("[HF RETRY] Uyku modundan uyanıyor...");
-        await Task.Delay(2500);
-
-        var r1b = await TryCall(primaryUrl);
-        if (r1b.ok) return r1b.label;
-    }
-
-    // 2) fallback endpoint
-    var r2 = await TryCall(fallbackUrl);
-    if (r2.ok) return r2.label;
+    var b = await TryCall(fallbackUrl);
+    if (b.ok) return b.label;
 
     return "neutral";
 }
 
-string GetEmoji(string sentiment) => sentiment switch
+string GetEmoji(string s) => s switch
 {
     "positive" => "😃",
     "negative" => "😠",
     _ => "😐"
 };
 
+/* ============================================================
+   ✅ USER API’LERİ
+   ============================================================ */
 
-// ✅ USER REGISTER
 app.MapPost("/api/users/register", async (AppDbContext db, UserCreateDto dto) =>
 {
     if (string.IsNullOrWhiteSpace(dto.Nickname))
@@ -157,30 +108,28 @@ app.MapPost("/api/users/register", async (AppDbContext db, UserCreateDto dto) =>
     if (await db.Users.AnyAsync(u => u.Nickname == dto.Nickname))
         return Results.Conflict(new { message = "Bu rumuz zaten kullanılıyor." });
 
-    var user = new User { Nickname = dto.Nickname, CreatedAt = DateTime.UtcNow };
+    var user = new User { Nickname = dto.Nickname };
     db.Users.Add(user);
     await db.SaveChangesAsync();
 
     return Results.Created($"/api/users/{user.Id}", user);
 }).WithOpenApi();
 
-
-// ✅ LOGIN
 app.MapPost("/api/users/login", async (AppDbContext db, UserCreateDto dto) =>
 {
-    var user = await db.Users.FirstOrDefaultAsync(u => u.Nickname == dto.Nickname);
-    return user is null ? Results.NotFound("Kullanıcı bulunamadı.") : Results.Ok(user);
+    var u = await db.Users.FirstOrDefaultAsync(x => x.Nickname == dto.Nickname);
+    return u is null ? Results.NotFound("Kullanıcı bulunamadı.") : Results.Ok(u);
 }).WithOpenApi();
 
-
-// ✅ USER LIST
 app.MapGet("/api/users", async (AppDbContext db) =>
 {
     return Results.Ok(await db.Users.OrderBy(u => u.Id).ToListAsync());
 }).WithOpenApi();
 
+/* ============================================================
+   ✅ GET/CREATE CONVERSATION
+   ============================================================ */
 
-// ✅ CONVERSATION HELPER
 async Task<Conversation> GetOrCreateConversation(AppDbContext db, int a, int b)
 {
     var convId = await db.ConversationMembers
@@ -191,24 +140,23 @@ async Task<Conversation> GetOrCreateConversation(AppDbContext db, int a, int b)
         .FirstOrDefaultAsync();
 
     if (convId != 0)
-        return await db.Conversations.FindAsync(convId)
-            ?? new Conversation { IsGroup = false, CreatedAt = DateTime.UtcNow };
+        return await db.Conversations.FindAsync(convId) ?? new Conversation();
 
-    var conv = new Conversation { IsGroup = false, CreatedAt = DateTime.UtcNow };
+    var conv = new Conversation();
     db.Conversations.Add(conv);
     await db.SaveChangesAsync();
 
-    db.ConversationMembers.AddRange(
-        new ConversationMember { ConversationId = conv.Id, UserId = a, JoinedAt = DateTime.UtcNow },
-        new ConversationMember { ConversationId = conv.Id, UserId = b, JoinedAt = DateTime.UtcNow }
-    );
+    db.ConversationMembers.Add(new ConversationMember { ConversationId = conv.Id, UserId = a });
+    db.ConversationMembers.Add(new ConversationMember { ConversationId = conv.Id, UserId = b });
     await db.SaveChangesAsync();
 
     return conv;
 }
 
+/* ============================================================
+   ✅ MESAJ GÖNDER
+   ============================================================ */
 
-// ✅ SEND MESSAGE
 app.MapPost("/api/messages/user/{receiverId}", async (AppDbContext db, int receiverId, MessageDto dto) =>
 {
     if (string.IsNullOrWhiteSpace(dto.Content))
@@ -241,22 +189,58 @@ app.MapPost("/api/messages/user/{receiverId}", async (AppDbContext db, int recei
     return Results.Created($"/api/messages/{msg.Id}", msg);
 }).WithOpenApi();
 
+/* ============================================================
+   ✅ SOL PANEL — TÜM KONVOYU DÖNER
+   ============================================================ */
 
-// ✅ GET CHAT HISTORY
-app.MapGet("/api/messages/user/{userAId}/{userBId}", async (AppDbContext db, int userAId, int userBId) =>
+app.MapGet("/api/conversations/of-user/{userId}", async (AppDbContext db, int userId) =>
 {
-    var convId = await db.ConversationMembers
-        .Where(m => m.UserId == userAId || m.UserId == userBId)
-        .GroupBy(m => m.ConversationId)
-        .Where(g => g.Select(x => x.UserId).Distinct().Count() == 2)
-        .Select(g => g.Key)
-        .FirstOrDefaultAsync();
+    var convIds = await db.ConversationMembers
+        .Where(c => c.UserId == userId)
+        .Select(c => c.ConversationId)
+        .Distinct()
+        .ToListAsync();
 
-    if (convId == 0)
-        return Results.Ok(new List<Message>());
+    var result = new List<object>();
 
+    foreach (var cid in convIds)
+    {
+        var other = await db.ConversationMembers
+            .Where(cm => cm.ConversationId == cid && cm.UserId != userId)
+            .Join(db.Users, cm => cm.UserId, u => u.Id,
+                (cm, u) => new { u.Id, u.Nickname })
+            .FirstOrDefaultAsync();
+
+        var last = await db.Messages
+            .Where(m => m.ConversationId == cid)
+            .OrderByDescending(m => m.SentAt)
+            .Select(m => new { m.Content, m.SentAt, m.SenderId })
+            .FirstOrDefaultAsync();
+
+        result.Add(new
+        {
+            conversationId = cid,
+            otherUser = other,
+            lastMessage = last?.Content,
+            lastSentAt = last?.SentAt,
+            lastSenderId = last?.SenderId
+        });
+    }
+
+    return Results.Ok(result.OrderByDescending(r =>
+        (DateTime?)r.GetType().GetProperty("lastSentAt")!.GetValue(r)
+    ));
+}).WithOpenApi();
+
+/* ============================================================
+   ✅ BİR KONVOYU MESAJLARI
+   ✅ cid HATASI DÜZELTİLDİ
+   ============================================================ */
+
+app.MapGet("/api/messages/conversation/{conversationId}", async (AppDbContext db, int conversationId) =>
+{
     var msgs = await db.Messages
-        .Where(m => m.ConversationId == convId)
+        .Where(m => m.ConversationId == conversationId)
         .OrderBy(m => m.SentAt)
         .ToListAsync();
 
@@ -265,8 +249,10 @@ app.MapGet("/api/messages/user/{userAId}/{userBId}", async (AppDbContext db, int
 
 app.Run();
 
+/* ============================================================
+   ✅ MODELLER
+   ============================================================ */
 
-// ✅ MODELS
 public class User
 {
     public int Id { get; set; }
@@ -279,7 +265,6 @@ public record UserCreateDto(string Nickname);
 public class Conversation
 {
     public int Id { get; set; }
-    public string? Name { get; set; }
     public bool IsGroup { get; set; } = false;
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
