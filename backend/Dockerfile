@@ -1,19 +1,28 @@
-# BUILD aşaması
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-WORKDIR /app
+# ============================
+# 1) Build Stage
+# ============================
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
 
-# csproj kopyala ve restore
-COPY *.csproj .
+# Proje dosyasını kopyala
+COPY backend.csproj ./
 RUN dotnet restore
 
-# tüm dosyaları kopyala ve build et
+# Tüm dosyaları kopyala ve publish et
 COPY . .
-RUN dotnet publish -c Release -o out
+RUN dotnet publish -c Release -o /app/publish
 
-# RUNTIME aşaması
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+# ============================
+# 2) Runtime Stage
+# ============================
+FROM mcr.microsoft.com/dotnet/aspnet:9.0
 WORKDIR /app
-COPY --from=build /app/out .
 
+# Publish edilmiş dosyaları al
+COPY --from=build /app/publish .
+
+# SQLite DB için çalışma dizini
+ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
+
 ENTRYPOINT ["dotnet", "backend.dll"]
